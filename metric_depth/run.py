@@ -12,13 +12,13 @@ from depth_anything_v2.dpt import DepthAnythingV2
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Depth Anything V2 Metric Depth Estimation')
     
-    parser.add_argument('--img-path', type=str)
+    parser.add_argument('--img-path', type=str, default='/home/wangqw/video_dataset/KITTI_street')
     parser.add_argument('--input-size', type=int, default=518)
-    parser.add_argument('--outdir', type=str, default='./vis_depth')
+    parser.add_argument('--outdir', type=str, default='/home/wangqw/video_dataset/KITTI_depth')
     
     parser.add_argument('--encoder', type=str, default='vitl', choices=['vits', 'vitb', 'vitl', 'vitg'])
-    parser.add_argument('--load-from', type=str, default='checkpoints/depth_anything_v2_metric_hypersim_vitl.pth')
-    parser.add_argument('--max-depth', type=float, default=20)
+    parser.add_argument('--load-from', type=str, default='/home/wangqw/video_program/Depth-Anything-V2/metric_depth/checkpoints/depth_anything_v2_metric_vkitti_vitl.pth')
+    parser.add_argument('--max-depth', type=float, default=80)
     
     parser.add_argument('--save-numpy', dest='save_numpy', action='store_true', help='save the model raw output')
     parser.add_argument('--pred-only', dest='pred_only', action='store_true', help='only display the prediction')
