@@ -11,6 +11,12 @@ import numpy as np
 import torch
 from PIL import Image
 import torchvision.transforms as transforms
+import torch.nn.functional as F
+import matplotlib.pyplot as plt
+from matplotlib.ticker import MultipleLocator
+import plotly.graph_objects as go
+from torchvision.utils import save_image
+
 to_pil_image = transforms.ToPILImage()
 
 from depth_anything_v2.dpt import DepthAnythingV2
@@ -191,37 +197,55 @@ def grd2cam2world2sat(xyz_grds, satmap_sidelength=512, require_jac=False, gt_dep
     return sat_uv, mask, None, None, None
 
 
-def sat2world(satmap_sidelength):
-    # satellite: u:east , v:south from bottomleft and u_center: east; v_center: north from center
-    # realword: X: south, Y:down, Z: east   origin is set to the ground plane
-
-    # meshgrid the sat pannel
-    i = j = torch.arange(0, satmap_sidelength).cuda()  # to(self.device)
-    ii, jj = torch.meshgrid(i, j)  # i:h,j:w
-
-    # uv is coordinate from top/left, v: south, u:east
-    uv = torch.stack([jj, ii], dim=-1).float()  # shape = [satmap_sidelength, satmap_sidelength, 2]
-
-    # sat map from top/left to center coordinate
-    u0 = v0 = satmap_sidelength // 2
-    uv_center = uv - torch.tensor(
-        [u0, v0]).cuda()  # .to(self.device) # shape = [satmap_sidelength, satmap_sidelength, 2]
-
-    # affine matrix: scale*R
+def sat2world(grd_H, grd_W, depth, img):
+    ori_camera_k = torch.tensor([[[582.9802,   0.0000, 496.2420],
+                                      [0.0000, 482.7076, 125.0034],
+                                      [0.0000,   0.0000,   1.0000]]], 
+                                    dtype=torch.float32, requires_grad=True)  # [1, 3, 3]
     meter_per_pixel = get_meter_per_pixel()
-    meter_per_pixel *= 512 / satmap_sidelength
-    R = torch.tensor([[0, 1], [1, 0]]).float().cuda()  # to(self.device) # u_center->z, v_center->x
-    Aff_sat2real = meter_per_pixel * R  # shape = [2,2]
+    camera_k = ori_camera_k.clone()
+    camera_k[:, :1, :] = ori_camera_k[:, :1,
+                            :] * grd_W / ori_grdW  # original size input into feature get network/ output of feature get network
+    camera_k[:, 1:2, :] = ori_camera_k[:, 1:2, :] * grd_H / ori_grdH
+    camera_k_inv = torch.inverse(camera_k)  # [B, 3, 3]
 
-    # Trans matrix from sat to realword
-    XZ = torch.einsum('ij, hwj -> hwi', Aff_sat2real,
-                        uv_center)  # shape = [satmap_sidelength, satmap_sidelength, 2]
+    v, u = torch.meshgrid(torch.arange(0, grd_H, dtype=torch.float32),
+                            torch.arange(0, grd_W, dtype=torch.float32))
+    uv1 = torch.stack([u, v, torch.ones_like(u)], dim=-1).unsqueeze(dim=0)  # [1, grd_H, grd_W, 3]
+    xyz_w = torch.sum(camera_k_inv[:, None, None, :, :] * uv1[:, :, :, None, :], dim=-1)  # [1, grd_H, grd_W, 3]
+    
+    xyz_grd = xyz_w * torch.from_numpy(depth).unsqueeze(0).unsqueeze(-1)
+    xyz_grd = xyz_grd / meter_per_pixel # [1, 256, 1024, 3]
+    xyz_grd[:,:,:,0:1] += 50
+    xyz_grd[:,:,:,2:-1] += 50
+    B, H, W, C = xyz_grd.shape
+    xyz_geo = xyz_grd.view(B*H*W, -1)
+    img_feat = img.view(B*H*W, -1)
+    kept = (xyz_geo[:,0] >= 0) & (xyz_geo[:,0] <= 100) & (xyz_geo[:,2] >= 0) & (xyz_geo[:,2] <= 100)
 
-    Y = torch.zeros_like(XZ[..., 0:1])
-    ones = torch.ones_like(Y)
-    sat2realwap = torch.cat([XZ[:, :, :1], Y, XZ[:, :, 1:], ones], dim=-1)  # [sidelength,sidelength,4]
+    xyz_geo_kept = xyz_geo[kept]
+    xyz_geo_kept = torch.floor(xyz_geo_kept)
+    img_kept = img_feat[kept]
+    rank = xyz_geo_kept[:, 0] * 100 + xyz_geo_kept[:, 2] * 100
+    sorts = rank.argsort()
 
-    return sat2realwap
+    xyz_geo_kept = xyz_geo_kept[sorts]
+    img_kept = img_kept[sorts]
+    rank = rank[sorts]
+
+    x = img_kept.cumsum(0)
+    kept = torch.ones(x.shape[0], dtype=torch.bool)
+    kept[:-1] = (rank[1:] != rank[:-1])
+
+    x, xyz_geo_kept = x[kept], xyz_geo_kept[kept]
+    x = torch.cat((x[:1], x[1:] - x[:-1]))
+
+    final = torch.zeros(1,3,100,100)
+    final[0, :, xyz_geo_kept[:, 0].long(), xyz_geo_kept[:, 2].long()] = x.to('cpu').t()
+    final_normalized = F.normalize(final, p=2, dim=1)
+    final_img = transforms.functional.to_pil_image(final_normalized.squeeze(0), mode='RGB')
+    final_img.save('final_img.png')
+    return xyz_grd
 
 def World2GrdImgPixCoordinates(ori_shift_u, ori_shift_v, ori_heading, XYZ_1, ori_camera_k, grd_H, grd_W,
                                    ori_grdH, ori_grdW):
@@ -243,8 +267,10 @@ def World2GrdImgPixCoordinates(ori_shift_u, ori_shift_v, ori_heading, XYZ_1, ori
     camera_height = 1.65
     # camera offset, shift[0]:east,Z, shift[1]:north,X
     height = camera_height * torch.ones_like(shift_u_meters)
-    T = torch.cat([shift_v_meters, height, -shift_u_meters], dim=-1)  # shape = [B, 3]
-    T = torch.unsqueeze(T, dim=-1)  # shape = [B,3,1]
+    T0 = torch.cat([shift_u_meters, height, -shift_v_meters], dim=-1)  # shape = [B, 3]
+    # T0 = torch.unsqueeze(T0, dim=-1)  # shape = [B, N, 3, 1]
+    # T = torch.einsum('bnij, bnj -> bni', -R, T0) # [B, N, 3]
+    T = torch.sum(-R * T0[:, None, :], dim=-1)   # [B, 3]
 
     # P = K[R|T]
     camera_k = ori_camera_k.clone()
@@ -300,7 +326,7 @@ def project_grd_to_map(grd_f, depth):
                                 [0.0000,   0.0000,   1.0000]]], 
                             dtype=torch.float32, requires_grad=True).to('cuda')  # [1, 3, 3]
     
-    XYZ_1 = sat2world(SatMap_original_sidelength, depth)  # [ sidelength,sidelength,4]
+    XYZ_1 = sat2world(256, 1024, depth, grd_f)  # [ sidelength,sidelength,4]
     uv, mask = World2GrdImgPixCoordinates(shift_u, shift_v, heading, XYZ_1, camera_k,
                                                 H, W, ori_grdH, ori_grdW)  # [B, S, E, H, W,2]
     # [B, H, W, 2], [2, B, H, W, 2], [1, B, H, W, 2]
@@ -311,7 +337,120 @@ def project_grd_to_map(grd_f, depth):
     return grd_f_trans
 
 
+def test(image_tensor, camera_k, depth, grd_image_width=1024, grd_image_height=256, sat_width=101, Camera_height=10):
+    torch.manual_seed(42)
+    meter_per_pixel = get_meter_per_pixel()
+
+    # test
+    # grd_image_width = 3
+    # grd_image_height = 3
+    # sat_width = 5 # pixel
+    # Camera_height = 10 #meter
+    # image_tensor = torch.randint(0, 256, (grd_image_height, grd_image_width, 3), dtype=torch.uint8).unsqueeze(0)
+    # camera_k = torch.tensor([[[1, 0, 1], [0, 1, 1], [0, 0, 1]]], dtype=torch.float32)
+    # depth = torch.tensor([
+    #     [1,1,1],
+    #     [1,2,1],
+    #     [1,2,1]
+    # ])
+    # depth = torch.tensor([
+    #     [1,2,1,1,2],
+    #     [1,3,1,2,1],
+    #     [2,1,2,4,1],
+    #     [1,3,1,2,1]
+    # ])
+
+    camera_k_inv = torch.inverse(camera_k)  # [B, 3, 3]
+
+    v, u = torch.meshgrid(torch.arange(0, grd_image_height, dtype=torch.float32),
+                            torch.arange(0, grd_image_width, dtype=torch.float32))
+    uv1 = torch.stack([u, v, torch.ones_like(u)], dim=-1).unsqueeze(dim=0)
+    xyz_w = torch.sum(camera_k_inv[:, None, None, :, :] * uv1[:, :, :, None, :], dim=-1)  # [1, grd_H, grd_W, 3]
+
+
+    depth = -depth.unsqueeze(0).unsqueeze(-1)
+    # xyz_grd = xyz_w * depth / meter_per_pixel
+    xyz_grd = xyz_w * depth * 1.3
+
+    # xyz_grd = xyz_grd.long()
+    # xyz_grd[:,:,:,0:1] += sat_width // 2
+    # xyz_grd[:,:,:,2:3] += sat_width // 2
+    B, H, W, C = xyz_grd.shape
+    xyz_grd = xyz_grd.view(B*H*W, -1)
+    xyz_grd[:, 0] = xyz_grd[:, 0].long()
+    xyz_grd[:, 2] = xyz_grd[:, 2].long()
+
+    kept = (xyz_grd[:,0] >= -(sat_width // 2)) & (xyz_grd[:,0] <= sat_width // 2) & (xyz_grd[:,2] <= 0) & (xyz_grd[:,2] >= -(sat_width - 1)) & (xyz_grd[:,1] >=-Camera_height)
+
+    xyz_grd_kept = xyz_grd[kept]
+    image_tensor_kept = image_tensor.view(B*H*W, -1)[kept]
+
+    min_height = xyz_grd_kept[:,1].min()
+
+    xyz_grd_kept[:,0] = sat_width // 2 - xyz_grd_kept[:,0]
+    xyz_grd_kept[:,1] = xyz_grd_kept[:,1] - min_height
+    xyz_grd_kept[:,2] = - xyz_grd_kept[:,2]
+    xyz_grd_kept = xyz_grd_kept[:,[2,0,1]]
+    rank = torch.stack((xyz_grd_kept[:, 0] * sat_width + xyz_grd_kept[:, 1] + 1, xyz_grd_kept[:, 2]), dim=1)
+    sorts_second = torch.argsort(rank[:, 1])
+    xyz_grd_kept = xyz_grd_kept[sorts_second]
+    image_tensor_kept = image_tensor_kept[sorts_second]
+    sorted_rank = rank[sorts_second]
+    sorts_first = torch.argsort(sorted_rank[:, 0], stable=True)
+    xyz_grd_kept = xyz_grd_kept[sorts_first]
+    image_tensor_kept = image_tensor_kept[sorts_first]
+    sorted_rank = sorted_rank[sorts_first]
+    kept = torch.ones_like(sorted_rank[:, 0])
+    kept[:-1] = sorted_rank[:, 0][:-1] != sorted_rank[:, 0][1:]
+    res_xyz = xyz_grd_kept[kept.bool()]
+    res_image = image_tensor_kept[kept.bool()]
+    
+    # grd_image_index = torch.cat((-res_xyz[:,1:2] + grd_image_width - 1,-res_xyz[:,0:1] + grd_image_height - 1), dim=-1)
+    final = torch.zeros(1,sat_width,sat_width,3).to(torch.uint8)
+    sat_height = torch.zeros(1,sat_width,sat_width,1).to(torch.float32)
+    final[0,res_xyz[:,1].long(),res_xyz[:,0].long(),:] = res_image
+    sat_height[0,res_xyz[:,1].long(),res_xyz[:,0].long(),:] = res_xyz[:,2].unsqueeze(-1)
+    
+    # 去掉 batch 维度，形状变为 [3, 3, 3]
+    tensor_image = final.squeeze(0)
+    np_image = tensor_image.numpy()
+    image = Image.fromarray(np_image)
+    image.save('target_image.png')
+    image_tensor = image_tensor.squeeze(0)
+    image_np = image_tensor.numpy()
+    image = Image.fromarray(image_np)
+    image.save('source_image.png')
+
+    # 生成3D点云
+    colors = image_tensor.view(B*H*W, -1)
+    # 创建颜色字符串列表
+    color_strings = ['rgb({}, {}, {})'.format(r, g, b) for r, g, b in colors]
+
+    # 使用 plotly 绘制点云
+    fig = go.Figure(data=[go.Scatter3d(
+        x=xyz_grd[:, 0],
+        y=xyz_grd[:, 1],
+        z=xyz_grd[:, 2],
+        mode='markers',
+        marker=dict(
+            size=3,
+            color=color_strings,  # 设置颜色
+        )
+    )])
+
+    # 设置坐标轴标签和刻度间隔
+    fig.update_layout(scene=dict(
+        xaxis=dict(title='X', tick0=0, dtick=1),
+        yaxis=dict(title='Y', tick0=0, dtick=1),
+        zaxis=dict(title='Z', tick0=0, dtick=1)
+    ))
+
+    # 显示图像
+    fig.show()
+
 if __name__ == '__main__':
+
+    # test()
     parser = argparse.ArgumentParser(description='Depth Anything V2 Metric Depth Estimation')
     
     parser.add_argument('--img-path', type=str, default='/home/wangqw/video_dataset/KITTI_street')
@@ -346,9 +485,9 @@ if __name__ == '__main__':
     depth_anything = depth_anything.to(DEVICE).eval()
 
     depth = depth_anything.infer_image(grd_image, args.input_size)
-    # mask = torch.load('depth.pt').clone().detach().cpu().numpy()
-    # mask[mask != 0] = 1
-    # depth = depth * mask
+    mask = torch.load('depth.pt').clone().detach().cpu().numpy()
+    mask[mask != 0] = 1
+    depth = depth * mask
     # showDepth(depth, grd_image)
     # depth = torch.tensor(depth, dtype=torch.float32)
     # depth = depth.unsqueeze(0).unsqueeze(-1)
@@ -369,5 +508,12 @@ if __name__ == '__main__':
 
     # 应用转换操作
     grd_image = transform(pil_image).to('cuda')
-    sat_project = project_grd_to_map(grd_image.unsqueeze(0), depth)
 
+    ori_camera_k = torch.tensor([[[582.9802, 0.0000, 496.2420],
+                            [0.0000, 482.7076, 125.0034],
+                            [0.0000, 0.0000, 1.0000]]],
+                        dtype=torch.float32, requires_grad=True)  # [1, 3, 3]
+
+
+    test(torch.from_numpy(grd_image_rgb).unsqueeze(0), ori_camera_k, torch.from_numpy(depth))
+    sat_project = project_grd_to_map(grd_image.unsqueeze(0), depth)
