@@ -1,7 +1,7 @@
 import os
 
-os.environ['CUDA_DEVICE_ORDER'] = 'PCI_BUS_ID'
-os.environ['CUDA_VISIBLE_DEVICES'] = '1'
+# os.environ['CUDA_DEVICE_ORDER'] = 'PCI_BUS_ID'
+# os.environ['CUDA_VISIBLE_DEVICES'] = '1'
 
 import argparse
 import cv2
@@ -337,10 +337,10 @@ def project_grd_to_map(grd_f, depth):
     return grd_f_trans
 
 
-def test(image_tensor, camera_k, depth, grd_image_width=1024, grd_image_height=256, sat_width=101, Camera_height=10):
+def predict_sat_height(image_tensor, camera_k, depth, grd_image_width=1024, grd_image_height=256, sat_width=101, Camera_height=10):
     torch.manual_seed(42)
     meter_per_pixel = get_meter_per_pixel()
-
+    image_tensor = image_tensor.permute(0,2,3,1)
     # test
     # grd_image_width = 3
     # grd_image_height = 3
@@ -364,13 +364,13 @@ def test(image_tensor, camera_k, depth, grd_image_width=1024, grd_image_height=2
 
     v, u = torch.meshgrid(torch.arange(0, grd_image_height, dtype=torch.float32),
                             torch.arange(0, grd_image_width, dtype=torch.float32))
-    uv1 = torch.stack([u, v, torch.ones_like(u)], dim=-1).unsqueeze(dim=0)
+    uv1 = torch.stack([u, v, torch.ones_like(u)], dim=-1).unsqueeze(dim=0).to('cuda')
     xyz_w = torch.sum(camera_k_inv[:, None, None, :, :] * uv1[:, :, :, None, :], dim=-1)  # [1, grd_H, grd_W, 3]
 
 
-    depth = -depth.unsqueeze(0).unsqueeze(-1)
+    depth = depth.unsqueeze(0).unsqueeze(-1)
     # xyz_grd = xyz_w * depth / meter_per_pixel
-    xyz_grd = xyz_w * depth * 1.3
+    xyz_grd = xyz_w * depth * 1.2
 
     # xyz_grd = xyz_grd.long()
     # xyz_grd[:,:,:,0:1] += sat_width // 2
@@ -380,16 +380,16 @@ def test(image_tensor, camera_k, depth, grd_image_width=1024, grd_image_height=2
     xyz_grd[:, 0] = xyz_grd[:, 0].long()
     xyz_grd[:, 2] = xyz_grd[:, 2].long()
 
-    kept = (xyz_grd[:,0] >= -(sat_width // 2)) & (xyz_grd[:,0] <= sat_width // 2) & (xyz_grd[:,2] <= 0) & (xyz_grd[:,2] >= -(sat_width - 1)) & (xyz_grd[:,1] >=-Camera_height)
+    kept = (xyz_grd[:,0] >= -(sat_width // 2)) & (xyz_grd[:,0] <= sat_width // 2) & (xyz_grd[:,2] >= -(sat_width // 2)) & (xyz_grd[:,2] <= sat_width // 2)
 
     xyz_grd_kept = xyz_grd[kept]
     image_tensor_kept = image_tensor.view(B*H*W, -1)[kept]
 
-    min_height = xyz_grd_kept[:,1].min()
+    max_height = xyz_grd_kept[:,1].max()
 
-    xyz_grd_kept[:,0] = sat_width // 2 - xyz_grd_kept[:,0]
-    xyz_grd_kept[:,1] = xyz_grd_kept[:,1] - min_height
-    xyz_grd_kept[:,2] = - xyz_grd_kept[:,2]
+    xyz_grd_kept[:,0] = xyz_grd_kept[:,0] + sat_width // 2
+    xyz_grd_kept[:,1] = max_height - xyz_grd_kept[:,1]
+    xyz_grd_kept[:,2] = xyz_grd_kept[:,2] + sat_width // 2
     xyz_grd_kept = xyz_grd_kept[:,[2,0,1]]
     rank = torch.stack((xyz_grd_kept[:, 0] * sat_width + xyz_grd_kept[:, 1] + 1, xyz_grd_kept[:, 2]), dim=1)
     sorts_second = torch.argsort(rank[:, 1])
@@ -406,51 +406,66 @@ def test(image_tensor, camera_k, depth, grd_image_width=1024, grd_image_height=2
     res_image = image_tensor_kept[kept.bool()]
     
     # grd_image_index = torch.cat((-res_xyz[:,1:2] + grd_image_width - 1,-res_xyz[:,0:1] + grd_image_height - 1), dim=-1)
-    final = torch.zeros(1,sat_width,sat_width,3).to(torch.uint8)
-    sat_height = torch.zeros(1,sat_width,sat_width,1).to(torch.float32)
+    final = torch.zeros(1,sat_width,sat_width,3).to(torch.float32).to('cuda')
+    sat_height = torch.zeros(1,sat_width,sat_width,1).to(torch.float32).to('cuda')
     final[0,res_xyz[:,1].long(),res_xyz[:,0].long(),:] = res_image
+
+    res_xyz[:,2][res_xyz[:,2] < 1e-1] = 1e-1
     sat_height[0,res_xyz[:,1].long(),res_xyz[:,0].long(),:] = res_xyz[:,2].unsqueeze(-1)
-    
-    # 去掉 batch 维度，形状变为 [3, 3, 3]
-    tensor_image = final.squeeze(0)
-    np_image = tensor_image.numpy()
-    image = Image.fromarray(np_image)
-    image.save('target_image.png')
-    image_tensor = image_tensor.squeeze(0)
-    image_np = image_tensor.numpy()
-    image = Image.fromarray(image_np)
-    image.save('source_image.png')
+    sat_height = sat_height.permute(0,3,1,2)
+
+    # torch.save(sat_height, 'sat_height.pt')
+
+    # visulize
+    # height_map = sat_height[0].squeeze(0)  # 现在形状为 [256, 1024]
+    # plt.imshow(height_map.cpu().detach().numpy(), cmap='viridis')  # 使用 'viridis' 映射显示颜色
+    # plt.colorbar(label='Satellite Height')
+    # plt.title('Height Map Visualization')
+    # plt.savefig('pred_height_img.png')
+    # plt.close()  
+    # # 去掉 batch 维度，形状变为 [3, 3, 3]
+    # tensor_image = final.squeeze(0)
+    # np_image = tensor_image.numpy()
+    # image = Image.fromarray(np_image)
+    # image.save('target_image.png')
+    # image_tensor = image_tensor.squeeze(0)
+    # image_np = image_tensor.numpy()
+    # image = Image.fromarray(image_np)
+    # image.save('source_image.png')
+
+    return sat_height, final.permute(0,3,1,2)
+
+
 
     # 生成3D点云
-    colors = image_tensor.view(B*H*W, -1)
-    # 创建颜色字符串列表
-    color_strings = ['rgb({}, {}, {})'.format(r, g, b) for r, g, b in colors]
+    # colors = image_tensor.view(B*H*W, -1)
+    # # 创建颜色字符串列表
+    # color_strings = ['rgb({}, {}, {})'.format(r, g, b) for r, g, b in colors]
 
-    # 使用 plotly 绘制点云
-    fig = go.Figure(data=[go.Scatter3d(
-        x=xyz_grd[:, 0],
-        y=xyz_grd[:, 1],
-        z=xyz_grd[:, 2],
-        mode='markers',
-        marker=dict(
-            size=3,
-            color=color_strings,  # 设置颜色
-        )
-    )])
+    # # 使用 plotly 绘制点云
+    # fig = go.Figure(data=[go.Scatter3d(
+    #     x=xyz_grd[:, 0],
+    #     y=xyz_grd[:, 1],
+    #     z=xyz_grd[:, 2],
+    #     mode='markers',
+    #     marker=dict(
+    #         size=3,
+    #         color=color_strings,  # 设置颜色
+    #     )
+    # )])
 
-    # 设置坐标轴标签和刻度间隔
-    fig.update_layout(scene=dict(
-        xaxis=dict(title='X', tick0=0, dtick=1),
-        yaxis=dict(title='Y', tick0=0, dtick=1),
-        zaxis=dict(title='Z', tick0=0, dtick=1)
-    ))
+    # # 设置坐标轴标签和刻度间隔
+    # fig.update_layout(scene=dict(
+    #     xaxis=dict(title='X', tick0=0, dtick=1),
+    #     yaxis=dict(title='Y', tick0=0, dtick=1),
+    #     zaxis=dict(title='Z', tick0=0, dtick=1)
+    # ))
 
-    # 显示图像
-    fig.show()
+    # # 显示图像
+    # fig.show()
 
 if __name__ == '__main__':
 
-    # test()
     parser = argparse.ArgumentParser(description='Depth Anything V2 Metric Depth Estimation')
     
     parser.add_argument('--img-path', type=str, default='/home/wangqw/video_dataset/KITTI_street')
@@ -514,6 +529,5 @@ if __name__ == '__main__':
                             [0.0000, 0.0000, 1.0000]]],
                         dtype=torch.float32, requires_grad=True)  # [1, 3, 3]
 
-
-    test(torch.from_numpy(grd_image_rgb).unsqueeze(0), ori_camera_k, torch.from_numpy(depth))
+    predict_sat_height(torch.from_numpy(grd_image_rgb).unsqueeze(0), ori_camera_k, torch.from_numpy(depth))
     sat_project = project_grd_to_map(grd_image.unsqueeze(0), depth)

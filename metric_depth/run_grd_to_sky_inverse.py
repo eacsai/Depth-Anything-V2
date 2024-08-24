@@ -1,7 +1,7 @@
 import os
 
 os.environ['CUDA_DEVICE_ORDER'] = 'PCI_BUS_ID'
-os.environ['CUDA_VISIBLE_DEVICES'] = '1'
+os.environ['CUDA_VISIBLE_DEVICES'] = '0'
 
 import argparse
 import cv2
@@ -11,6 +11,8 @@ import numpy as np
 import torch
 from PIL import Image
 import torchvision.transforms as transforms
+import torch.nn.functional as F
+
 to_pil_image = transforms.ToPILImage()
 
 from depth_anything_v2.dpt import DepthAnythingV2
@@ -21,6 +23,7 @@ SatMap_process_sidelength = 512 # 0.2 m per pixel
 Default_lat = 49.015
 EPS = 1e-07
 ori_grdH, ori_grdW = 256, 1024
+camera_height = 1.65
 
 def grid_sample(image, optical, jac=None):
     # values in optical within range of [0, H], and [0, W]
@@ -56,7 +59,7 @@ def grid_sample(image, optical, jac=None):
     mask_y = (iy >= 0) & (iy <= IH - 1)
     mask = mask_x * mask_y
 
-    assert torch.sum(mask) > 0
+    # assert torch.sum(mask) > 0
 
     nw = (ix_se - ix) * (iy_se - iy) * mask
     ne = (ix - ix_sw) * (iy_sw - iy) * mask
@@ -205,7 +208,7 @@ def sat2world(satmap_sidelength):
     # sat map from top/left to center coordinate
     u0 = v0 = satmap_sidelength // 2
     uv_center = uv - torch.tensor(
-        [u0, v0]).cuda()  # .to(self.device) # shape = [satmap_sidelength, satmap_sidelength, 2]
+        [0, v0]).cuda()  # .to(self.device) # shape = [satmap_sidelength, satmap_sidelength, 2]
 
     # affine matrix: scale*R
     meter_per_pixel = get_meter_per_pixel()
@@ -217,11 +220,18 @@ def sat2world(satmap_sidelength):
     XZ = torch.einsum('ij, hwj -> hwi', Aff_sat2real,
                         uv_center)  # shape = [satmap_sidelength, satmap_sidelength, 2]
 
-    Y = torch.zeros_like(XZ[..., 0:1])
-    ones = torch.ones_like(Y)
-    sat2realwap = torch.cat([XZ[:, :, :1], Y, XZ[:, :, 1:], ones], dim=-1)  # [sidelength,sidelength,4]
+    Y = torch.ones_like(XZ[..., 0:1]) * 10
+    sat_height = torch.load('sat_height.pt').permute(0,3,1,2)
+    sat_height = F.interpolate(sat_height, size=(satmap_sidelength, satmap_sidelength), mode='bilinear', align_corners=False)
+    sat_height = sat_height.squeeze(0).permute(1,2,0)
+    depth_mask = torch.ones_like(sat_height)
+    depth_mask[sat_height == 0] = 0
+    Y = -sat_height.to('cuda') * 0.5 + 1.65
+    # Y = Y * camera_height
+    # ones = torch.ones_like(Y)
+    sat2realwap = torch.cat([XZ[:, :, :1], Y, XZ[:, :, 1:]], dim=-1)  # [sidelength,sidelength,4]
 
-    return sat2realwap
+    return sat2realwap, depth_mask.permute(2,0,1).to('cuda')
 
 def World2GrdImgPixCoordinates(ori_shift_u, ori_shift_v, ori_heading, XYZ_1, ori_camera_k, grd_H, grd_W,
                                    ori_grdH, ori_grdW):
@@ -240,9 +250,10 @@ def World2GrdImgPixCoordinates(ori_shift_u, ori_shift_v, ori_heading, XYZ_1, ori
     R = torch.cat([cos, zeros, -sin, zeros, ones, zeros, sin, zeros, cos], dim=-1)  # shape = [B,9]
     R = R.view(B, 3, 3)  # shape = [B,3,3]
 
-    camera_height = 1.65
+    camera_height = 1.65 * 2
     # camera offset, shift[0]:east,Z, shift[1]:north,X
-    height = camera_height * torch.ones_like(shift_u_meters)
+    # height = camera_height * torch.ones_like(shift_u_meters)
+    height = 0.0 * torch.ones_like(shift_u_meters)
     T = torch.cat([shift_v_meters, height, -shift_u_meters], dim=-1)  # shape = [B, 3]
     T = torch.unsqueeze(T, dim=-1)  # shape = [B,3,1]
 
@@ -252,8 +263,9 @@ def World2GrdImgPixCoordinates(ori_shift_u, ori_shift_v, ori_heading, XYZ_1, ori
                             :] * grd_W / ori_grdW  # original size input into feature get network/ output of feature get network
     camera_k[:, 1:2, :] = ori_camera_k[:, 1:2, :] * grd_H / ori_grdH
     P = camera_k @ torch.cat([R, T], dim=-1)
-
-    uv1 = torch.sum(P[:, None, None, :, :] * XYZ_1[None, :, :, None, :], dim=-1)
+    P = camera_k
+    # uv1 = torch.sum(P[:, None, None, :, :] * XYZ_1[None, :, :, None, :], dim=-1)
+    uv1 = torch.einsum('ijk,kl->ijl', XYZ_1, P.squeeze(0).T).unsqueeze(0)
     # only need view in front of camera ,Epsilon = 1e-6
     uv1_last = torch.maximum(uv1[:, :, :, 2:], torch.ones_like(uv1[:, :, :, 2:]) * 1e-6)
     uv = uv1[:, :, :, :2] / uv1_last  # shape = [B, H, W, 2]
@@ -276,7 +288,7 @@ def showDepth(depth, raw_image):
     
     cv2.imwrite(output_path, combined_result)
 
-def project_grd_to_map(grd_f, depth):
+def project_grd_to_map(grd_f):
     '''
     grd_f: [B, C, H, W]
     grd_c: [B, 1, H, W]
@@ -291,27 +303,106 @@ def project_grd_to_map(grd_f, depth):
 
     B, C, H, W = grd_f.size()
     
-    heading = torch.ones(1, 1).to('cuda') * (-0.8362) * 10 / 180 * np.pi
-    shift_u = torch.ones(1, 1).to('cuda') * (0.2122) * 20
-    shift_v = torch.ones(1, 1).to('cuda') * (-0.7794) * 20
+    heading = torch.ones(1, 1).to('cuda') * (0) * 10 / 180 * np.pi
+    shift_u = torch.ones(1, 1).to('cuda') * (0) * 20
+    shift_v = torch.ones(1, 1).to('cuda') * (0) * 20
 
     camera_k = torch.tensor([[[582.9802,   0.0000, 496.2420],
                                 [0.0000, 482.7076, 125.0034],
                                 [0.0000,   0.0000,   1.0000]]], 
                             dtype=torch.float32, requires_grad=True).to('cuda')  # [1, 3, 3]
     
-    XYZ_1 = sat2world(SatMap_original_sidelength, depth)  # [ sidelength,sidelength,4]
+    XYZ_1, depth_mask = sat2world(SatMap_original_sidelength)  # [ sidelength,sidelength,4]
     uv, mask = World2GrdImgPixCoordinates(shift_u, shift_v, heading, XYZ_1, camera_k,
                                                 H, W, ori_grdH, ori_grdW)  # [B, S, E, H, W,2]
     # [B, H, W, 2], [2, B, H, W, 2], [1, B, H, W, 2]
 
     grd_f_trans, _ = grid_sample(grd_f, uv, jac=None)
-    grd_img = to_pil_image(grd_f_trans[0])
-    grd_img.save('porject_grd.png')
+
+    grd_img = to_pil_image(grd_f_trans[0] * depth_mask)
+    grd_img.save('porject_grd_height.png')
     return grd_f_trans
 
 
+def test():
+    torch.manual_seed(42)
+    meter_per_pixel = get_meter_per_pixel()
+
+    # test
+    grd_image_width = 3
+    grd_image_height = 3
+    sat_width = 5 # pixel
+    Camera_height = 10 #meter
+    grd_tensor = torch.randint(0, 256, (grd_image_height, grd_image_width, 3), dtype=torch.uint8).unsqueeze(0)
+    camera_k = torch.tensor([[[1, 0, 1], [0, 1, 1], [0, 0, 1]]], dtype=torch.float32)
+    depth = torch.tensor([
+        [0,0,0],
+        [1,1,1],
+        [-1,-1,-1]
+    ])
+    # 创建一个全零的张量，形状为 [3, 3, 3]
+    sat_tensor = torch.zeros(3, 3, 3)
+    # 设置上边三个格子为绿色
+    sat_tensor[0, :, :] = torch.tensor([0, 255, 0])
+    # 设置中间三个格子为灰色
+    sat_tensor[1, :, :] = torch.tensor([128, 128, 128])
+    # 设置下边三个格子为红色
+    sat_tensor[2, :, :] = torch.tensor([255, 0, 0])
+    sat_tensor = sat_tensor.unsqueeze(0)
+
+    image_tensor = sat_tensor.squeeze(0)
+    image_np = image_tensor.numpy().astype(np.uint8)
+    image = Image.fromarray(image_np)
+    image.save('source_sat_image.png')
+
+    # 创建一个全零的张量，形状为 [3, 3, 3]
+    grd_tensor = torch.zeros(3, 3, 3)
+    # 设置上边三个格子为绿色
+    grd_tensor[1:3, 0, :] = torch.tensor([0, 255, 0])
+    # 设置中间三个格子为灰色
+    grd_tensor[2:3, 1, :] = torch.tensor([128, 128, 128])
+    # 设置下边三个格子为红色
+    grd_tensor[:, 2, :] = torch.tensor([255, 255, 255])
+    grd_tensor = grd_tensor.unsqueeze(0)
+
+    image_tensor = grd_tensor.squeeze(0)
+    image_np = image_tensor.numpy().astype(np.uint8)
+    image = Image.fromarray(image_np)
+    image.save('source_grd_image.png')
+
+    height = torch.tensor([[1,1,1],[0,0,0],[5,5,5]])
+    i = j =torch.arange(0, 3)
+    ii, jj = torch.meshgrid(i, j)
+    uv = torch.stack([jj, ii], dim=-1).float()
+    uv_center = uv - torch.tensor([0, 1])
+    R = torch.tensor([[0, 1], [1, 0]]).float()
+    XZ = torch.einsum('ij, hwj -> hwi', R, uv_center)
+    Y = torch.ones_like(XZ[..., 0:1]) * -1
+    Y = depth.unsqueeze(-1)
+    XYZ = torch.cat([XZ[:, :, :1], Y, XZ[:, :, 1:]], dim=-1)
+
+    uv_w = torch.einsum('ijk,kl->ijl', XYZ, camera_k.squeeze(0).T).unsqueeze(0)
+    uv_w_last = torch.maximum(uv_w[..., 2:], torch.ones_like(uv_w[..., 2:]) * 1e-6)
+    uv_res = uv_w[..., :2] / uv_w_last
+
+    grd_f_trans, _ = grid_sample(grd_tensor.permute(0,3,1,2), uv_res, jac=None)
+    # grd_tensor (B,H,W,C) -> (B,C,H,W)
+    output = F.grid_sample(grd_tensor.permute(0,3,1,2), uv_res - 1, mode='bilinear', padding_mode='zeros', align_corners=False)
+    # output (B,C,H,W) -> (B,H,W,C)
+    image_tensor = output.permute(0,2,3,1).squeeze(0)
+    image_np = image_tensor.numpy().astype(np.uint8)
+    image = Image.fromarray(image_np)
+    image.save('porject_grd_height.png')
+    # depth = torch.tensor([
+    #     [1,2,1,1,2],
+    #     [1,3,1,2,1],
+    #     [2,1,2,4,1],
+    #     [1,3,1,2,1]
+    # ])    
+
+
 if __name__ == '__main__':
+    # test()
     parser = argparse.ArgumentParser(description='Depth Anything V2 Metric Depth Estimation')
     
     parser.add_argument('--img-path', type=str, default='/home/wangqw/video_dataset/KITTI_street')
@@ -339,13 +430,13 @@ if __name__ == '__main__':
     
     # 读取图片
     sat_img = Image.open('./sat.png')  # 替换为你的图片路径
-    grd_image = cv2.imread('./grd.png')
+    grd_image = cv2.imread('./grd_2.png')
 
-    depth_anything = DepthAnythingV2(**{**model_configs[args.encoder], 'max_depth': args.max_depth})
-    depth_anything.load_state_dict(torch.load(args.load_from, map_location='cpu'))
-    depth_anything = depth_anything.to(DEVICE).eval()
+    # depth_anything = DepthAnythingV2(**{**model_configs[args.encoder], 'max_depth': args.max_depth})
+    # depth_anything.load_state_dict(torch.load(args.load_from, map_location='cpu'))
+    # depth_anything = depth_anything.to(DEVICE).eval()
 
-    depth = depth_anything.infer_image(grd_image, args.input_size)
+    # depth = depth_anything.infer_image(grd_image, args.input_size)
     # mask = torch.load('depth.pt').clone().detach().cpu().numpy()
     # mask[mask != 0] = 1
     # depth = depth * mask
@@ -369,5 +460,5 @@ if __name__ == '__main__':
 
     # 应用转换操作
     grd_image = transform(pil_image).to('cuda')
-    sat_project = project_grd_to_map(grd_image.unsqueeze(0), depth)
+    sat_project = project_grd_to_map(grd_image.unsqueeze(0))
 
