@@ -23,6 +23,10 @@ transform = transforms.Compose([
     transforms.Resize((256, 1024)),  # 调整图片尺寸
     transforms.ToTensor()  # 转换为张量
 ])
+# transform = transforms.Compose([
+#     transforms.Resize((128, 512)),  # 调整图片尺寸
+#     transforms.ToTensor()  # 转换为张量
+# ])
 camera_k_inv = torch.inverse(camera_k)  # [B, 3, 3]
 
 def get_images_from_directory(root_dir, extensions=['.jpg', '.png', '.jpeg', '.bmp', '.gif'], grd_image_width=1024, grd_image_height=256, sat_width=101):
@@ -42,6 +46,7 @@ def get_images_from_directory(root_dir, extensions=['.jpg', '.png', '.jpeg', '.b
                           parent_dir = os.path.abspath(os.path.join(image_dir, os.pardir))
                           os.makedirs(os.path.join(parent_dir, 'grd_forward_map'), exist_ok=True)
                           os.makedirs(os.path.join(parent_dir, 'sat_height'), exist_ok=True)
+                          os.makedirs(os.path.join(parent_dir, 'grd_depth'), exist_ok=True)
                           depth_dir = os.path.join(parent_dir, 'grd_depth')
                           for grd_image in tqdm(image_files, desc=f'Processing {os.path.join(date, time)}', leave=True):
                               if grd_image.endswith(tuple(extensions)):
@@ -49,9 +54,10 @@ def get_images_from_directory(root_dir, extensions=['.jpg', '.png', '.jpeg', '.b
                                   grd_image_pil = Image.open(os.path.join(image_dir, grd_image))
                                   grd_image_tensor = transform(grd_image_pil).unsqueeze(0).to('cuda')
                                   sat_height, project_grd_img = predict_sat_height(grd_image_tensor, camera_k, depth)
+                                #   print(sat_height.shape, project_grd_img.shape)
                                   torch.save(sat_height, os.path.join(parent_dir, 'sat_height', grd_image.replace('.png', '_sat_height.pt')))
-                                  project_grd_img = to_pil(project_grd_img.squeeze(0))
-                                  project_grd_img.save(os.path.join(parent_dir, 'grd_forward_map', grd_image))
+                                #   project_grd_img = to_pil(project_grd_img.squeeze(0))
+                                #   project_grd_img.save(os.path.join(parent_dir, 'grd_forward_map', grd_image))
     return image_files
 
 # Example usage
