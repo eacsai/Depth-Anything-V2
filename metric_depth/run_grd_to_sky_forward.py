@@ -511,18 +511,29 @@ raw2alpha = lambda raw, dists, act_fn=F.relu: 1.-torch.exp(-act_fn(raw) * dists)
 class DepthPrediction(nn.Module):
     def __init__(self):
         super(DepthPrediction, self).__init__()
-        # 使用两个卷积层，保证输入输出维度一致
-        self.conv1 = nn.Conv2d(3, 16, kernel_size=3, stride=1, padding=1)
-        self.relu = nn.ReLU()
-        self.conv2 = nn.Conv2d(16, 3, kernel_size=3, stride=1, padding=1)
-        self.sigmoid = nn.Sigmoid()  # 使用Sigmoid激活函数
-
+        # 定义一个简单的卷积层
+        self.conv1 = nn.Conv2d(3, 3, kernel_size=3, stride=1, padding=1, bias=False)
+        self.bn1 = nn.BatchNorm2d(3)  # 批归一化层
+        self.relu = nn.ReLU(inplace=True)
+        
+        # 定义输出层，将通道数从 3 转换为 1，用于输出深度
+        self.conv2 = nn.Conv2d(3, 1, kernel_size=1, stride=1, padding=0, bias=True)
+        
     def forward(self, x):
-        x = self.conv1(x)
-        x = self.relu(x)
-        x = self.conv2(x)
-        x = self.sigmoid(x)  # 将输出限制在0到1之间
-        return x
+        identity = x  # 跳跃连接的输入
+        
+        # 卷积 -> 批归一化 -> ReLU
+        out = self.conv1(x)
+        out = self.bn1(out)
+        out = self.relu(out)
+        
+        # 跳跃连接：将输入 identity 加到输出
+        out += identity
+        
+        # 通过输出层，将通道数变为 1
+        out = self.conv2(out)
+        out = F.softmax(out, dim=1)
+        return out
 
 
 def test():
@@ -545,48 +556,45 @@ def test():
         [[[
           [1.0000, 0.0000, 0.0000],
           [1.0000, 0.0000, 0.0000],
-          [1.0000, 1.0000, 0.0000]],
+          [1.0000, 1.0000, 1.0000]],
 
          [[1.0000, 0.0000, 1.0000],
           [1.0000, 0.0000, 1.0000],
-          [1.0000, 0.0000, 1.0000]],
+          [0.0000, 0.0000, 0.0000]],
 
          [[1.0000, 0.0000, 0.0000],
           [1.0000, 0.0000, 0.0000],
-          [1.0000, 0.0000, 0.0000]]]], dtype=torch.float32)
+          [0.0000, 0.0000, 0.0000]]]], dtype=torch.float32)
     
-    image_tensor = torch.tensor(
-        [[[
-          [1.0000, 0.0000, 0.0000],
-          [1.0000, 0.0000, 0.0000],
-          [1.0000, 1.0000, 0.0000]],
-
-         [[1.0000, 0.0000, 1.0000],
-          [1.0000, 0.0000, 1.0000],
-          [1.0000, 0.0000, 1.0000]],
-
-         [[1.0000, 0.0000, 0.0000],
-          [1.0000, 0.0000, 0.0000],
-          [1.0000, 0.0000, 0.0000]]]], dtype=torch.float32)
     depth = torch.tensor([
-        [3,0,3],
         [2,0,2],
-        [1,1,1]
+        [2,0,2],
+        [2,1,2]
     ])
-    # 将 depth 转换为 one-hot 编码
-    one_hot_result = torch.nn.functional.one_hot(depth, num_classes=4)  # num_classes=4 表示4个类别: 0, 1, 2, 3
+    # one-hot
+    # # 将 depth 转换为 one-hot 编码
+    # one_hot_result = torch.nn.functional.one_hot(depth, num_classes=4)  # num_classes=4 表示4个类别: 0, 1, 2, 3
+    # # 删除第四个类别
+    # one_hot_result = one_hot_result[..., 1:].float()
+    # # 增加一个维度
+    # pixel_scales = one_hot_result.unsqueeze(0)
 
-    # 删除第四个类别
-    one_hot_result = one_hot_result[..., 1:].float()
-
+    # probability
+    # 理想的深度值列表
+    ideal_depth_values = torch.arange(3).type(torch.float32) + 1
+    # 计算每个元素到理想深度值的差异，得到误差矩阵
+    # 使用 torch.abs(depth.unsqueeze(-1) - ideal_depth_values)
+    error_matrix = torch.abs(depth.unsqueeze(-1) - ideal_depth_values)
+    # # 计算负的平方误差，并应用softmax以转换为概率分布
+    # probability_tensor = torch.exp(-error_matrix**2)
+    # probability_tensor = probability_tensor / probability_tensor.sum(dim=-1, keepdim=True)
+    # # 为了处理可能出现的深度值为0的情况
+    # # 如果 depth == 0, 则设置对应的one-hot向量为 [0, 0, 0]
+    # pixel_scales = torch.where(depth.unsqueeze(-1) == 0, torch.zeros_like(probability_tensor), probability_tensor)
     # 增加一个维度
-    project_depth = one_hot_result.unsqueeze(0)
-    # depth = torch.tensor([
-    #     [1,2,1,1,2],
-    #     [1,3,1,2,1],
-    #     [2,1,2,4,1],
-    #     [1,3,1,2,1]
-    # ])
+    pixel_scales = F.softmax(-error_matrix**2, dim=-1)
+    pixel_scales = pixel_scales.unsqueeze(0)
+
     camera_k = torch.tensor([[[1, 0.0000, 1.5],
                               [0.0000, 1, 1.5],
                               [0.0000, 0.0000, 1.5]]],
@@ -600,7 +608,7 @@ def test():
     # log_scale_norm = log_scale_norm * 2 - 1
     # indices = log_scale_norm.unsqueeze(-1)
     # indices = torch.stack([torch.zeros_like(indices), indices], -1)
-    pixel_scales = torch.tensor([[[0,0,1],[0,0,0],[0,0,1]],[[0,1,0],[0,0,0],[0,1,0]],[[1,0,0],[1,0,0],[1,0,0]]], dtype=torch.float32).unsqueeze(0)
+    # pixel_scales = torch.tensor([[[0,0,1],[0,0,0],[0,0,1]],[[0,1,0],[0,0,0],[0,1,0]],[[1,0,0],[1,0,0],[1,0,0]]], dtype=torch.float32).unsqueeze(0)
     # mask = torch.tensor([[[1,1,1],[0,0,0],[1,1,1]],[[1,1,1],[0,0,0],[1,1,1]],[[1,1,1],[1,1,1],[1,1,1]]], dtype=torch.float32).unsqueeze(0)
     # 将非0元素变为1，0元素保持为0
     binary_tensor = (depth != 0).float()  # 生成一个二值化tensor，非零为1，零为0
@@ -622,10 +630,10 @@ def test():
     model = DepthPrediction()
     depth_scores = pixel_scales.permute(0,3,1,2)
     output_scores = model(depth_scores).permute(0,2,3,1) * mask
-    output_scores = pixel_scales
+    # output_scores = pixel_scales * mask
     # dists = torch.ones_like(depth_scores)
     # alpha = raw2alpha(depth_scores, dists)
-
+    ideal_depth_values = ideal_depth_values.unsqueeze(0).unsqueeze(0).unsqueeze(0).repeat(1, 3, 3, 1)
     weights = output_scores * torch.cumprod(torch.cat([torch.ones((output_scores.shape[0],1,output_scores.shape[2],output_scores.shape[3])), (1. - output_scores)], 1), 1)[:,:-1,:,:]
     # depth_prob = torch.softmax(depth_scores, dim=1)
     # image_polar = torch.einsum("...dhw,...hwz->...dzw", image_tensor, depth_prob)
@@ -673,7 +681,7 @@ def test():
     # project_grd_img.save('grd_image_tensor.png')
 
 if __name__ == '__main__':
-    # test()
+    test()
     parser = argparse.ArgumentParser(description='Depth Anything V2 Metric Depth Estimation')
     
     parser.add_argument('--img-path', type=str, default='/home/wangqw/video_dataset/KITTI_street')

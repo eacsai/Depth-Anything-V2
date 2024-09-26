@@ -1,5 +1,6 @@
 import os
-os.environ['CUDA_LAUNCH_BLOCKING'] = '0'
+os.environ['CUDA_DEVICE_ORDER'] = 'PCI_BUS_ID'
+os.environ['CUDA_VISIBLE_DEVICES'] = '2'
 import torch.nn as nn
 from typing import Optional
 
@@ -16,18 +17,31 @@ from depth_anything_v2.dpt import DepthAnythingV2
 class DepthPrediction(nn.Module):
     def __init__(self):
         super(DepthPrediction, self).__init__()
-        # 使用两个卷积层，保证输入输出维度一致
-        self.conv1 = nn.Conv2d(80, 80, kernel_size=3, stride=1, padding=1)
-        self.relu = nn.ReLU()
-        self.conv2 = nn.Conv2d(80, 80, kernel_size=3, stride=1, padding=1)
-        self.sigmoid = nn.Sigmoid()  # 使用Sigmoid激活函数
+        # 定义一个简单的卷积层
+        self.conv1 = nn.Conv2d(80, 80, kernel_size=3, stride=1, padding=1, bias=False)
+        self.bn1 = nn.BatchNorm2d(80)  # 批归一化层
+        self.relu = nn.ReLU(inplace=True)
+        self.conv2 = nn.Conv2d(80, 80, kernel_size=3, stride=1, padding=1, bias=True)
+        self.sigmoid = nn.Sigmoid()
 
     def forward(self, x):
-        x = self.conv1(x)
-        x = self.relu(x)
-        x = self.conv2(x)
-        x = self.sigmoid(x)  # 将输出限制在0到1之间
-        return x
+        identity = x  # 跳跃连接的输入
+        
+        # 卷积 -> 批归一化 -> ReLU
+        out = self.conv1(x)
+        # out = self.bn1(out)
+        out = self.relu(out)
+        
+        # 跳跃连接：将输入 identity 加到输出
+        out += identity
+        out = self.conv2(out)
+        # 应用 softmax 到输出结果
+        # 这里假设你希望在 HxW 维度上应用 softmax
+        out = self.sigmoid(out)  # 通常在通道维度应用 softmax
+        
+        return out
+
+criterion = torch.nn.MSELoss()
 
 def make_grid(
     w: float,
@@ -62,12 +76,86 @@ def from_homogeneous(points, eps: float = 1e-8):
     """
     return points[..., :-1] / (points[..., -1:] + eps)
 
+def forward_mapping_v2(origin_depth, grd_image, camera_k):
+    # one-hot编码
+    # project_depth = origin_depth.long()
+    # # 将 depth 转换为 one-hot 编码
+    # one_hot_depth = torch.nn.functional.one_hot(project_depth, num_classes=81)  # num_classes=4 表示4个类别: 0, 1, 2, 3
+    # # 删除第四个类别
+    # one_hot_depth = one_hot_depth[..., 1:].float()
+    # # 增加一个维度
+    # one_hot_depth = one_hot_depth.unsqueeze(0)
+
+    # 生成深度值列表
+    # 理想的深度值列表
+    ideal_depth_values = torch.arange(80).type(torch.float32) + 1
+    # 计算每个元素到理想深度值的差异，得到误差矩阵
+    # 使用 torch.abs(depth.unsqueeze(-1) - ideal_depth_values)
+    error_matrix = torch.abs(origin_depth.unsqueeze(-1) - ideal_depth_values.to(origin_depth.device))
+    # # 计算负的平方误差，并应用softmax以转换为概率分布
+    # probability_tensor = torch.exp(-error_matrix**2)
+    # probability_tensor = probability_tensor / probability_tensor.sum(dim=-1, keepdim=True)
+    # # 为了处理可能出现的深度值为0的情况
+    # # 如果 depth == 0, 则设置对应的one-hot向量为 [0, 0, 0]
+    # one_hot_depth = torch.where(origin_depth.unsqueeze(-1) == 0, torch.zeros_like(probability_tensor), probability_tensor)
+    # 增加一个维度
+    one_hot_depth = F.softmax(-error_matrix**2, dim=-1)
+    one_hot_depth = one_hot_depth.unsqueeze(0)
+
+    binary_tensor = (origin_depth != 0).float()  # 生成一个二值化tensor，非零为1，零为0
+    # 将tensor扩展到所需形状 [3, 3, 80]
+    mask = binary_tensor.unsqueeze(-1).repeat(1, 1, 80)
+    # 增加一个维度
+    mask = mask.unsqueeze(0)
+
+    # predict depth
+    model = DepthPrediction().to('cuda')
+    depth_scores = one_hot_depth.permute(0,3,1,2)
+    output = model(depth_scores).permute(0,2,3,1)
+    output_scores = output * mask
+    estimate_depth = output_scores * ideal_depth_values.to(output_scores.device) / output_scores.sum(dim=1, keepdim=True)
+    estimate_depth = estimate_depth.sum(dim=-1, keepdim=False)
+    mse_loss = criterion(estimate_depth, origin_depth.unsqueeze(0))
+    # print('MSE Loss:', mse_loss.item())
+    output_scores = one_hot_depth * mask
+    weights = output_scores * torch.cumprod(torch.cat([torch.ones((output_scores.shape[0],1,output_scores.shape[2],output_scores.shape[3])).to('cuda'), (1. - output_scores)], 1), 1)[:,:-1,:,:]
+    # depth_prob = torch.softmax(depth_scores, dim=1)
+    # image_polar = torch.einsum("...dhw,...hwz->...dzw", image_tensor, depth_prob)
+    image_polar = torch.einsum("...dhw,...hwz->...dzw", grd_image, weights)
+
+    f = camera_k[:, 0, 0][..., None, None]
+    c = camera_k[:, 0, 2][..., None, None]
+
+    z_max = 100
+    x_max = 50
+    z_min = 0
+    Δ = 100 / 512
+
+    grid_xz = make_grid(
+        x_max * 2, z_max, step_y=Δ, step_x=Δ, orig_y=-50, orig_x=-x_max, y_up=False
+    ).to('cuda')
+    u = from_homogeneous(grid_xz).squeeze(-1) * f + c
+    # u= torch.flip(u, dims=[-1])
+    z_idx = (grid_xz[..., 1] - z_min)
+    z_idx = z_idx[None].expand_as(u)
+    grid_polar = torch.stack([u, z_idx], -1)
+
+    size = grid_polar.new_tensor(image_polar.shape[-2:][::-1])
+    grid_uz_norm = (grid_polar * 2 / size) - 1
+    # grid_uz_norm = grid_uz_norm * grid_polar.new_tensor([1, -1])  # y axis is up
+    image_bev = F.grid_sample(image_polar, grid_uz_norm, align_corners=False)
+
+    # visualize
+    # origin_image_show = to_pil_image(grd_image[0])
+    # origin_image_show.save('origin_image.png')
+    # image_polar_show = to_pil_image(image_polar[0])
+    # image_polar_show.save('image_polar.png')
+    image_bev_show = to_pil_image(image_bev[0])
+    image_bev_show.save('image_bev.png')
+    return image_bev[0]
+
 if __name__ == '__main__':
     DEVICE = 'cuda' if torch.cuda.is_available() else 'mps' if torch.backends.mps.is_available() else 'cpu'
-    Satmap_zoom = 18
-    SatMap_original_sidelength = 512 # 0.2 m per pixel
-    SatMap_process_sidelength = 512 # 0.2 m per pixel
-    Default_lat = 49.015
     EPS = 1e-07
     ori_grdH, ori_grdW = 256, 1024
 
@@ -79,16 +167,16 @@ if __name__ == '__main__':
     }
 
     sat_img = Image.open('./sat.png')  # 替换为你的图片路径
-    grd_image = cv2.imread('./grd.png')
+    grd_image = cv2.imread('./grd_2.png')
 
     depth_anything = DepthAnythingV2(**{**model_configs['vitl'], 'max_depth': 80})
     depth_anything.load_state_dict(torch.load('/home/wangqw/video_program/Depth-Anything-V2/metric_depth/checkpoints/depth_anything_v2_metric_vkitti_vitl.pth', map_location='cpu'))
     depth_anything = depth_anything.to(DEVICE).eval()
 
     depth = depth_anything.infer_image(grd_image, 518)
-    mask = torch.load('depth.pt').clone().detach().cpu().numpy()
+    mask = torch.load('depth1.pt').clone().detach().cpu().numpy()
     mask[mask != 0] = 1
-    origin_depth = depth * mask
+    origin_depth = torch.from_numpy(depth * mask)
 
     # 定义转换
     transform = transforms.Compose([
@@ -115,57 +203,4 @@ if __name__ == '__main__':
     camera_k[:, :1, :] = camera_k[:, :1, :] * ori_grdW / 1242  # original size input into feature get network/ output of feature get network
     camera_k[:, 1:2, :] = camera_k[:, 1:2, :] * ori_grdH / 375
 
-    project_depth = torch.from_numpy(origin_depth).long()
-
-    # 将 depth 转换为 one-hot 编码
-    one_hot_depth = torch.nn.functional.one_hot(project_depth, num_classes=81)  # num_classes=4 表示4个类别: 0, 1, 2, 3
-    # 删除第四个类别
-    one_hot_depth = one_hot_depth[..., 1:].float()
-    # 增加一个维度
-    one_hot_depth = one_hot_depth.unsqueeze(0)
-
-    binary_tensor = (project_depth != 0).float()  # 生成一个二值化tensor，非零为1，零为0
-    # 将tensor扩展到所需形状 [3, 3, 80]
-    mask = binary_tensor.unsqueeze(-1).repeat(1, 1, 80)
-    # 增加一个维度
-    mask = mask.unsqueeze(0)
-
-    # predict depth
-    # model = DepthPrediction()
-    # depth_scores = one_hot_depth.permute(0,3,1,2)
-    # output_scores = model(depth_scores).permute(0,2,3,1) * mask
-    
-    output_scores = one_hot_depth * mask
-    weights = output_scores * torch.cumprod(torch.cat([torch.ones((output_scores.shape[0],1,output_scores.shape[2],output_scores.shape[3])), (1. - output_scores)], 1), 1)[:,:-1,:,:]
-    # depth_prob = torch.softmax(depth_scores, dim=1)
-    # image_polar = torch.einsum("...dhw,...hwz->...dzw", image_tensor, depth_prob)
-    image_polar = torch.einsum("...dhw,...hwz->...dzw", grd_image, weights)
-
-    f = camera_k[:, 0, 0][..., None, None]
-    c = camera_k[:, 0, 2][..., None, None]
-
-    z_max = 100
-    x_max = 50
-    z_min = 0
-    Δ = 100 / 512
-
-    grid_xz = make_grid(
-        x_max * 2, z_max, step_y=Δ, step_x=Δ, orig_y=-50, orig_x=-x_max, y_up=False
-    )
-    u = from_homogeneous(grid_xz).squeeze(-1) * f + c
-    # u= torch.flip(u, dims=[-1])
-    z_idx = (grid_xz[..., 1] - z_min)
-    z_idx = z_idx[None].expand_as(u)
-    grid_polar = torch.stack([u, z_idx], -1)
-
-    size = grid_polar.new_tensor(image_polar.shape[-2:][::-1])
-    grid_uz_norm = (grid_polar * 2 / size) - 1
-    # grid_uz_norm = grid_uz_norm * grid_polar.new_tensor([1, -1])  # y axis is up
-    image_bev = F.grid_sample(image_polar, grid_uz_norm, align_corners=False)
-
-    origin_image_show = to_pil_image(grd_image[0])
-    origin_image_show.save('origin_image.png')
-    image_polar_show = to_pil_image(image_polar[0])
-    image_polar_show.save('image_polar.png')
-    image_bev_show = to_pil_image(image_bev[0])
-    image_bev_show.save('image_bev.png')
+    forward_mapping_v2(origin_depth.to('cuda'), grd_image.to('cuda'), camera_k.to('cuda'))
