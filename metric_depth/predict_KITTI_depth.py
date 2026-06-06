@@ -55,7 +55,8 @@ def get_images_from_directory(root_dir, extensions=['.jpg', '.png', '.jpeg', '.b
     depth_anything_v2 = depth_anything_v2.to('cuda').eval()
 
     v, u = torch.meshgrid(torch.arange(0, grd_image_height, dtype=torch.float32),
-                            torch.arange(0, grd_image_width, dtype=torch.float32))
+                            torch.arange(0, grd_image_width, dtype=torch.float32),
+                            indexing='ij')
     uv1 = torch.stack([u, v, torch.ones_like(u)], dim=-1).unsqueeze(dim=0).to('cuda')
     grd_image_files = []
     with torch.no_grad():
@@ -78,16 +79,21 @@ def get_images_from_directory(root_dir, extensions=['.jpg', '.png', '.jpeg', '.b
                                   grd_image_cv2_v1 = cv2.cvtColor(grd_image_cv2, cv2.COLOR_BGR2RGB) / 255.0
                                   grd_image_cv2_v1 = transform({'image': grd_image_cv2_v1})['image']
                                   grd_image_cv2_v1 = torch.from_numpy(grd_image_cv2_v1).unsqueeze(0).to('cuda')
+                                  # DepthAnything V1 outputs relative depth (disparity-like):
+                                  # higher → closer foreground, near-zero → distant sky. Threshold
+                                  # below a small value to zero out sky pixels in the final mask.
                                   mask = depth_anything_v1(grd_image_cv2_v1)
                                   mask = F.interpolate(mask[None], (256, 1024), mode='bilinear', align_corners=False)[0, 0]
-                                  mask[mask != 0] = 1
+                                  sky_threshold = 0.05  # tune per-dataset if the sky leaks through
+                                  mask = (mask > sky_threshold).float()
 
                                   depth = depth_anything_v2.infer_image(grd_image_cv2, 518)
                                   depth = torch.from_numpy(depth).to('cuda').unsqueeze(0)
                                   depth = F.interpolate(depth[None], (256, 1024), mode='bilinear', align_corners=False)[0, 0]
                                   depth = depth * mask
 
-                                  torch.save(depth, os.path.join(parent_dir, 'grd_depth', f'{grd_image.replace(".png", "")}_grd_depth.pt'))
+                                  grd_image_stem = os.path.splitext(grd_image)[0]
+                                  torch.save(depth, os.path.join(parent_dir, 'grd_depth', f'{grd_image_stem}_grd_depth.pt'))
 
                                   xyz_w = torch.sum(camera_k_inv[:, None, None, :, :] * uv1[:, :, :, None, :], dim=-1)  # [1, grd_H, grd_W, 3]
                                   depth = depth.unsqueeze(0).unsqueeze(-1)
@@ -99,12 +105,10 @@ def get_images_from_directory(root_dir, extensions=['.jpg', '.png', '.jpeg', '.b
                                   max_height = xyz_grd[:,1].max()
                                   xyz_grd[:,1] = max_height - xyz_grd[:,1]
                                   grd_height = xyz_grd[:,1].view(B, H, W, 1)
-                                  torch.save(grd_height, os.path.join(parent_dir, 'grd_height', f'{grd_image.replace(".png", "")}_grd_height.pt'))
-    return image_files
+                                  torch.save(grd_height, os.path.join(parent_dir, 'grd_height', f'{grd_image_stem}_grd_height.pt'))
+
 
 # Example usage
-root_directory = '/home/wangqw/video_dataset/KITTI/depth_data'  # Replace with your directory path
-images = get_images_from_directory(root_directory)
-
-for img in images:
-    print(img)
+if __name__ == '__main__':
+    root_directory = '/home/wangqw/video_dataset/KITTI/depth_data'  # Replace with your directory path
+    get_images_from_directory(root_directory)
